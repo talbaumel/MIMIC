@@ -14,6 +14,12 @@ def read_label_file(file_name):
         d[code] = count
     return nltk.SimpleGoodTuringProbDist(d), d.keys()
 
+
+def dict_to_probfreq(d):
+    d = nltk.FreqDist(d)
+    return nltk.SimpleGoodTuringProbDist(d), d.keys()
+
+
 def kl(p, q, keys):
     return sum(map(lambda i: p.prob(i)*np.log(p.prob(i)/q.prob(i)), keys))
 

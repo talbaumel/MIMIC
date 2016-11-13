@@ -1,3 +1,5 @@
+#input for sklearn code
+
 from token_analsys import mimic_doc_yielder
 import numpy as np
 MIMIC_PATH = '../../MIMIC2/MIMIC_PREPROCESSED'
