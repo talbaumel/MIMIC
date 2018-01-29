@@ -1,2 +1,0 @@
-# MIMIC
-Updated soon

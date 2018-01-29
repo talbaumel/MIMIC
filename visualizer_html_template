@@ -1,0 +1,77 @@
+
+<html>
+	<head>
+		<title>HA-GRU</title>
+		<meta name="viewport" content="width=device-width, initial-scale=1.0">
+		<!-- Latest compiled and minified CSS -->
+		<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.5/css/bootstrap.min.css">
+
+		<!-- Optional theme -->
+		<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.5/css/bootstrap-theme.min.css">
+
+		<!-- Latest compiled and minified JavaScript -->
+		<script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.5/js/bootstrap.min.js"></script>
+
+		<script>
+		var attention_values = ###WEIGHTS###
+		var label_names = ###LABEL_NAMES###
+		function float2color( percentage ) {
+		    var color_part_dec = 255 * (1-percentage);
+		    var color_part_hex = Number(parseInt( color_part_dec , 10)).toString(16);
+		    return "#"+color_part_hex+color_part_hex + color_part_hex;
+		}
+
+		function myFunction(selected) {
+			attention = attention_values[selected]
+
+			for (i = 0; i < attention.length; i++) { 
+				new_color = float2color(attention[i]);
+			    document.getElementById("sent"+i).style.backgroundColor	 = new_color;
+			}
+            document.getElementById("title").innerText = 'Release Note: '+label_names[selected]
+		}
+
+		</script>
+	</head>
+	<body>
+		<div class="container">
+			
+			<div class="starter-template">
+				<div class="row">
+					<div class="col-xs-12 col-md-8">
+						<h1>HA-GRU vizualizer</h1>
+
+						<h4>Correctly predicted codes (TP)</h4>
+                            ###TPS###
+						<h4>Wrongly predicted codes (FP):</h4>
+							###FPS###
+						<h4>Missed codes (FN):</h4>
+							###FNS###
+						<br/><br/>
+						<h3 id="title">Release Note:</h3>
+
+						<table class="table">
+						    <tbody style="background-color:AliceBlue;">
+						      ###SENTS###
+						    </tbody>
+						  </table>
+                          
+                          <nav aria-label="Page navigation example">
+                          <ul class="pagination">
+                            <li class="page-item"><a class="page-link" href="###PREV###">Previous</a></li>
+                            <li class="page-item"><a class="page-link" href="###NEXT###">Next</a></li>
+                          </ul>
+                        </nav>
+						
+						
+						
+						
+					</div>
+
+					
+				</div>
+					
+			</div>
+		</div>
+	</body>
+</html>

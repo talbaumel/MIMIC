@@ -1,0 +1,901 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Using TensorFlow backend.\n"
+     ]
+    }
+   ],
+   "source": [
+    "from keras.preprocessing.sequence import pad_sequences\n",
+    "import read_mimic_flat\n",
+    "import os\n",
+    "from keras.utils.np_utils import to_categorical\n",
+    "import pickle\n",
+    "import numpy as np\n",
+    "import keras\n",
+    "from keras.models import Model\n",
+    "from keras.layers import Dense, Input, Flatten, Convolution1D, AtrousConvolution1D\n",
+    "from keras.layers import GlobalMaxPooling1D, GlobalMaxPooling1D, Lambda, concatenate\n",
+    "from keras import backend as K\n",
+    "from keras.layers.core import Dropout, Reshape, Activation\n",
+    "from keras.layers.pooling import AveragePooling1D\n",
+    "from keras.layers.embeddings import Embedding\n",
+    "from keras.regularizers import l2\n",
+    "from keras.optimizers import Adagrad\n",
+    "from collections import defaultdict\n",
+    "from keras.layers.recurrent import LSTM\n",
+    "from keras.layers.normalization import BatchNormalization\n",
+    "import tensorflow as tf\n",
+    "from tensorflow.python.framework import ops\n",
+    "from tensorflow.python.ops import math_ops\n",
+    "from keras.callbacks import EarlyStopping, TensorBoard\n",
+    "from sklearn.preprocessing import normalize\n",
+    "from keras.optimizers import SGD\n",
+    "from keras.models import Sequential\n",
+    "from keras.objectives import binary_crossentropy, categorical_crossentropy\n",
+    "#tf.python.control_flow_ops = tf\n",
+    "from full_eval import full_evaluate\n",
+    "\n",
+    "np.random.seed(1)\n",
+    "tf.set_random_seed(1)\n",
+    "\n",
+    "os.environ[\"CUDA_VISIBLE_DEVICES\"]=\"0\""
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "expand = False\n",
+    "shaped = True\n",
+    "add_desc = False\n",
+    "generlize = True\n",
+    "\n",
+    "EMBEDDINGS_SIZE = 100 #D in the paper\n",
+    "nb_epochs = 25\n",
+    "batch_size = 32\n",
+    "num_channels = 300 #H in the paper\n",
+    "filter_len = 4\n",
+    "DROPOUT_P = 0.1 #P in the paper\n",
+    "lmbd = 0 #l2 regularization\n",
+    "hidden_size = 400\n",
+    "trainable_embeddings = True\n",
+    "loss_func = binary_crossentropy"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "desc_dict = {}\n",
+    "for line in open('mimic/2/ICD9_descriptions'):\n",
+    "    line = line.strip().split('\\t')\n",
+    "    desc_dict[line[0]] = line[1]\n",
+    "    \n",
+    "def get_data():\n",
+    "    global VOCAB_SIZE, NUM_OF_CLASSES, SEQ_LEN, reader\n",
+    "    def to_categorical(y, nb_classes=None):\n",
+    "        y = np.array(y)\n",
+    "        if not nb_classes:\n",
+    "            nb_classes = np.max(y) + 1\n",
+    "        n = y.shape[0]\n",
+    "        categorical = np.zeros((n, nb_classes))\n",
+    "        for i, sample in enumerate(y):\n",
+    "            for l in sample:\n",
+    "                categorical[i, l] = 1\n",
+    "        return categorical\n",
+    "\n",
+    "    reader = read_mimic_flat.mimic_reader(version, expand=expand, shaped=shaped, add_desc=add_desc, generlize=generlize)\n",
+    "    X_train, X_test, y_trains, y_test, tokens_vocab, labels_vocab = reader.read_mimic()\n",
+    "\n",
+    "    VOCAB_SIZE = len(tokens_vocab) + 1\n",
+    "    NUM_OF_CLASSES = len(labels_vocab)\n",
+    "\n",
+    "\n",
+    "    X_train = pad_sequences(X_train, maxlen=None, dtype='int32',\n",
+    "        padding='pre', truncating='pre', value=len(tokens_vocab))\n",
+    "    X_test = pad_sequences(X_test, maxlen=len(X_train[0]), dtype='int32',\n",
+    "        padding='pre', truncating='pre', value=len(tokens_vocab))\n",
+    "\n",
+    "    SEQ_LEN = len(X_train[0])\n",
+    "\n",
+    "    y_train = to_categorical(y_trains, NUM_OF_CLASSES)\n",
+    "    y_test = to_categorical(y_test, NUM_OF_CLASSES)\n",
+    "    \n",
+    "    return X_train, X_test, y_train, y_test, tokens_vocab, labels_vocab"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "def my_init(shape, name=None):\n",
+    "    value = np.random.random(shape)\n",
+    "    value = 2*value-0.5\n",
+    "    value = value*4*np.sqrt(6)/np.sqrt(shape[0]+shape[1])\n",
+    "    return K.variable(value, name=name)\n",
+    "\n",
+    "def my_loss(neg_p):\n",
+    "    def f(output, target):\n",
+    "        out = K.binary_crossentropy(output, target)\n",
+    "        target = target*(1.-neg_p)+neg_p\n",
+    "        out = K.dot(out, K.transpose(target))\n",
+    "        return K.mean(out)\n",
+    "    return f\n",
+    "\n",
+    "def create_cbow_model():\n",
+    "    np.random.seed(1)\n",
+    "    tf.set_random_seed(1)\n",
+    "    model = Sequential()\n",
+    "    #sents = Input(shape=(SEQ_LEN,), dtype='int32')\n",
+    "    model.add(Embedding(VOCAB_SIZE, EMBEDDINGS_SIZE, input_length=SEQ_LEN, W_regularizer=l2(lmbd)))\n",
+    "    \n",
+    "    model.add(AveragePooling1D(pool_length=SEQ_LEN))\n",
+    "    #model.add(GlobalMaxPooling1D())\n",
+    "    model.add(Flatten())\n",
+    "    model.add(Dropout(DROPOUT_P))\n",
+    "    \n",
+    "    model.add(Dense(NUM_OF_CLASSES, init=my_init, activation=None, W_regularizer = l2(lmbd)))\n",
+    "    model.add(BatchNormalization())\n",
+    "    model.add(Activation('sigmoid'))\n",
+    "    model.compile('adam', loss_func)\n",
+    "    #model.compile('adam', my_loss, metrics=['binary_accuracy'])\n",
+    "    \n",
+    "    return model\n",
+    "\n",
+    "\n",
+    "def create_cnn_model():\n",
+    "    np.random.seed(1)\n",
+    "    tf.set_random_seed(1)\n",
+    "    model = Sequential()\n",
+    "    model.add(Embedding(VOCAB_SIZE, EMBEDDINGS_SIZE, input_length=SEQ_LEN, W_regularizer=l2(lmbd)))\n",
+    "\n",
+    "    model.add(Convolution1D(num_channels, filter_len, border_mode='valid', activation=None, W_regularizer = l2(lmbd)))\n",
+    "    #model.add(Activation('relu'))\n",
+    "    model.add(Activation('tanh'))\n",
+    "    model.add(GlobalMaxPooling1D())\n",
+    "    model.add(Dropout(DROPOUT_P))\n",
+    "    \n",
+    "    if hidden_size:\n",
+    "        model.add(Dense(hidden_size, activation=None, W_regularizer = l2(lmbd)))\n",
+    "        model.add(BatchNormalization())\n",
+    "        #model.add(Activation('relu'))\n",
+    "        model.add(Activation('tanh'))\n",
+    "        model.add(Dropout(DROPOUT_P))\n",
+    "\n",
+    "    model.add(Dense(NUM_OF_CLASSES, init=my_init, activation=None, W_regularizer = l2(lmbd)))\n",
+    "    model.add(BatchNormalization())\n",
+    "    model.add(Activation('sigmoid'))\n",
+    "    #model.compile('adam', 'categorical_crossentropy', metrics=['binary_accuracy'])\n",
+    "    model.compile('adam', loss_func)\n",
+    "\n",
+    "    return model\n",
+    "\n",
+    "def create_inc_model():\n",
+    "    np.random.seed(1)\n",
+    "    tf.set_random_seed(1)\n",
+    "    \n",
+    "    sents = Input(shape=(SEQ_LEN,), dtype='int32')\n",
+    "    embeded = Embedding(VOCAB_SIZE, EMBEDDINGS_SIZE, input_length=SEQ_LEN, W_regularizer=l2(lmbd))(sents)\n",
+    "    \n",
+    "    inc_m = []\n",
+    "    for i in range(1, 4):\n",
+    "        conv = Convolution1D(num_channels, i, border_mode='valid', activation=None, W_regularizer = l2(lmbd))(embeded)\n",
+    "        conv = Activation('tanh')(conv)\n",
+    "        conv = GlobalMaxPooling1D()(conv)\n",
+    "        conv = Dropout(DROPOUT_P)(conv)\n",
+    "        inc_m.append(conv)\n",
+    "    merged = concatenate(inc_m)\n",
+    "    pred = Dense(NUM_OF_CLASSES, init=my_init, activation=None, W_regularizer = l2(lmbd))(merged)\n",
+    "    pred = BatchNormalization()(pred)\n",
+    "    pred = Activation('sigmoid')(pred)\n",
+    "    \n",
+    "    model = Model(inputs=sents, outputs=pred)\n",
+    "    #model.compile('adam', 'categorical_crossentropy', metrics=['binary_accuracy'])\n",
+    "    model.compile('adam', loss_func)\n",
+    "\n",
+    "    return model\n",
+    "\n",
+    "def train(model):\n",
+    "    np.random.seed(1)\n",
+    "    tf.set_random_seed(1)\n",
+    "\n",
+    "    early_stopping = EarlyStopping(patience=1)\n",
+    "    model.fit(X_train, [y_train], epochs=nb_epochs, batch_size=batch_size, shuffle = True, verbose=1)\n",
+    "    return model\n",
+    "\n",
+    "def evaluate(model, name):\n",
+    "    with open('pred/'+name, 'w') as fp:\n",
+    "        preds = model.predict(X_test, batch_size=batch_size)\n",
+    "        for threshold in [0.5]:\n",
+    "            icd_preds = []\n",
+    "            for pred in preds:\n",
+    "                labels = []\n",
+    "                for i, l in enumerate(pred):\n",
+    "                    if l > threshold:\n",
+    "                        labels.append(labels_vocab[i])\n",
+    "                fp.write(','.join(labels)+'\\n')\n",
+    "                icd_preds.append(labels)\n",
+    "            #print('threshold', str(threshold))\n",
+    "            evaluate = reader.evaluate(icd_preds)\n",
+    "            for key in evaluate:\n",
+    "                print(key)\n",
+    "                print(evaluate[key])\n",
+    "        \n",
+    "def evaluate2(model, _):\n",
+    "    preds = model.predict(X_test, batch_size=batch_size)\n",
+    "    \n",
+    "    print('regular eval')\n",
+    "    all_preds = []\n",
+    "    for pred in preds:\n",
+    "        labels = set()\n",
+    "        for i, l in enumerate(pred):\n",
+    "            if l > 0.5:\n",
+    "                labels.add(i)\n",
+    "        all_preds.append(labels)\n",
+    "    \n",
+    "    gold_y = []\n",
+    "    for g in y_test:\n",
+    "        labels = set()\n",
+    "        for i, l in enumerate(g):\n",
+    "            if l > 0.5:\n",
+    "                labels.add(i)\n",
+    "        gold_y.append(labels)\n",
+    "            \n",
+    "    tp, fp, fn =0., 0., 0.      \n",
+    "    for pred, gold in zip(all_preds, gold_y):\n",
+    "        tp += len(pred.intersection(gold))\n",
+    "        fp += len(pred-gold)\n",
+    "        fn += len(gold-pred)\n",
+    "    prec = tp/(tp+fp)\n",
+    "    print(prec)\n",
+    "    recal = tp/(tp+fn)\n",
+    "    print(recal)\n",
+    "    f = 2*(prec*recal)/(prec+recal)\n",
+    "    print(f)\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.5/dist-packages/ipykernel_launcher.py:20: UserWarning: Update your `Embedding` call to the Keras 2 API: `Embedding(73651, 100, input_length=8421, embeddings_regularizer=<keras.reg...)`\n",
+      "/usr/local/lib/python3.5/dist-packages/ipykernel_launcher.py:22: UserWarning: Update your `AveragePooling1D` call to the Keras 2 API: `AveragePooling1D(pool_size=8421)`\n",
+      "/usr/local/lib/python3.5/dist-packages/ipykernel_launcher.py:27: UserWarning: Update your `Dense` call to the Keras 2 API: `Dense(948, kernel_initializer=<function ..., activation=None, kernel_regularizer=<keras.reg...)`\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "cbow\n",
+      "Epoch 1/25\n",
+      "20533/20533 [==============================] - 21s - loss: 0.5593    \n",
+      "Epoch 2/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.3637    \n",
+      "Epoch 3/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.2472    \n",
+      "Epoch 4/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.1755    \n",
+      "Epoch 5/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.1296    \n",
+      "Epoch 6/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.0989    \n",
+      "Epoch 7/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.0778    \n",
+      "Epoch 8/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.0629    \n",
+      "Epoch 9/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.0520    \n",
+      "Epoch 10/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.0440    \n",
+      "Epoch 11/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.0380    \n",
+      "Epoch 12/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.0335    \n",
+      "Epoch 13/25\n",
+      "20533/20533 [==============================] - 20s - loss: 0.0300    \n",
+      "Epoch 14/25\n",
+      "10400/20533 [==============>...............] - ETA: 10s - loss: 0.0277"
+     ]
+    }
+   ],
+   "source": [
+    "version = '2'\n",
+    "\n",
+    "X_train, X_test, y_train, y_test, tokens_vocab, labels_vocab = get_data()\n",
+    "\n",
+    "model1 = create_cbow_model()\n",
+    "\n",
+    "print('cbow')\n",
+    "model1 = train(model1)\n",
+    "print(full_evaluate(model1.predict(X_test, batch_size=batch_size), y_test))\n",
+    "#evaluate(model1, 'cbow2')\n",
+    "#evaluate2(model1, 'cbow2')\n",
+    "#evaluate3(model1, 'cbow2')\n",
+    "\n",
+    "model2 = create_cnn_model()\n",
+    "\n",
+    "print('cnn')\n",
+    "model2 = train(model2) \n",
+    "print(full_evaluate(model2.predict(X_test, batch_size=batch_size), y_test))\n",
+    "#evaluate(model2, 'cnn2')\n",
+    "#evaluate2(model2, 'cnn2')\n",
+    "\n",
+    "#model3 = create_inc_model()\n",
+    "\n",
+    "#print('inc')\n",
+    "#model3 = train(model3) \n",
+    "#evaluate(model3, 'inc2')\n",
+    "#evaluate2(model3, 'inc2')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.5/dist-packages/ipykernel_launcher.py:20: UserWarning: Update your `Embedding` call to the Keras 2 API: `Embedding(121596, 100, input_length=14042, embeddings_regularizer=<keras.reg...)`\n",
+      "/usr/local/lib/python3.5/dist-packages/ipykernel_launcher.py:22: UserWarning: Update your `AveragePooling1D` call to the Keras 2 API: `AveragePooling1D(pool_size=14042)`\n",
+      "/usr/local/lib/python3.5/dist-packages/ipykernel_launcher.py:27: UserWarning: Update your `Dense` call to the Keras 2 API: `Dense(1047, kernel_initializer=<function ..., activation=None, kernel_regularizer=<keras.reg...)`\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "cbow\n",
+      "Epoch 1/1\n",
+      "31904/49857 [==================>...........] - ETA: 25s - loss: 0.5013"
+     ]
+    }
+   ],
+   "source": [
+    "version = '3'\n",
+    "\n",
+    "X_train, X_test, y_train, y_test, tokens_vocab, labels_vocab = get_data()\n",
+    "\n",
+    "model1 = create_cbow_model()\n",
+    "print('cbow')\n",
+    "model1 = train(model1)\n",
+    "print(full_evaluate(model1.predict(X_test, batch_size=batch_size), y_test))\n",
+    "#\n",
+    "#evaluate(model1, 'cbow3')\n",
+    "#evaluate2(model1, 'cbow3')\n",
+    "\n",
+    "model2 = create_cnn_model()\n",
+    "print('cnn')\n",
+    "model2 = train(model2) \n",
+    "print(full_evaluate(model2.predict(X_test, batch_size=batch_size), y_test))\n",
+    "#evaluate(model2, 'cnn3')\n",
+    "#evaluate2(model2, 'cnn3')\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "sents = Input(shape=(SEQ_LEN,), dtype='int32')\n",
+    "embeded = model2.layers[0](sents)\n",
+    "conv = model2.layers[1](embeded)\n",
+    "just_conv_model = Model(inputs=sents, outputs=conv)\n",
+    "just_conv_model.compile('adam', loss_func)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 130,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "def analyze_example(x, y , model, just_conv): \n",
+    "    prediction = model.predict(x)[0]\n",
+    "    predicted = set()\n",
+    "    for i, l in enumerate(prediction):\n",
+    "        if l > 0.5:\n",
+    "            predicted.add(desc_dict[labels_vocab[i]])\n",
+    "    \n",
+    "    gold = set()\n",
+    "    for i, l in enumerate(y):\n",
+    "        if l > 0.5:\n",
+    "            gold.add(desc_dict[labels_vocab[i]])\n",
+    "    \n",
+    "    print('######TP######')\n",
+    "    print(predicted & gold)\n",
+    "    print('######FP######')\n",
+    "    print(predicted - gold)\n",
+    "    print('######FN######')\n",
+    "    print(gold - predicted)\n",
+    "    \n",
+    "    prediction = just_conv.predict(X_train[:1])[0]\n",
+    "    best_found = []\n",
+    "    for channel in range(num_channels):\n",
+    "        best_score = 0\n",
+    "        best_index = 0\n",
+    "        for i, ngram_scores in enumerate(prediction):\n",
+    "            if ngram_scores[channel] > best_score:\n",
+    "                best_score = ngram_scores[channel]\n",
+    "                best_index = i\n",
+    "        \n",
+    "        best_found.append((best_score, best_index, channel))\n",
+    "    \n",
+    "    print('########max words#######')\n",
+    "    for _, best_index, channel in sorted(best_found, reverse=True)[:30]:\n",
+    "        important = ' '.join([tokens_vocab[num] for num in x[0][best_index-5:best_index+5]])\n",
+    "        if important:\n",
+    "            print('channel num:', channel)\n",
+    "            print(important)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 131,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "######TP######\n",
+      "{'Acute renal failure, unspecified', 'Unspecified septicemia', 'Other shock without mention of trauma', 'Congestive heart failure, unspecified', 'Cardiac arrest', 'Cellulitis and abscess of leg, except foot', 'Acute myocardial infarction, subendocardial infarction, initial episode of care'}\n",
+      "######FP######\n",
+      "set()\n",
+      "######FN######\n",
+      "{'Unspecified protein-calorie malnutrition', 'Other primary cardiomyopathies'}\n",
+      "########max words#######\n",
+      "channel num: 194\n",
+      "in date ) . d . alzheimer 's dementia .\n",
+      "channel num: 245\n",
+      "already taking for right lower extremity cellulitis prior to admission\n",
+      "channel num: 19\n",
+      "ddd ; the total time elapsed from the beginning of\n",
+      "channel num: 56\n",
+      ") . d . alzheimer 's dementia . d .\n",
+      "channel num: 160\n",
+      "groin b.i.d . dd . santyl lotion to heels b.i.d\n",
+      "channel num: 178\n",
+      ", he performed poorly on a modified barium swallowing study\n",
+      "channel num: 284\n",
+      "wound cultures . dd . severe peripheral vascular disease ;\n",
+      "channel num: 241\n",
+      "decision was made to not pursue further invasive procedures given\n",
+      "channel num: 283\n",
+      "chest pain that was relieved by npg sl and morphine\n",
+      "channel num: 264\n",
+      ". d . type d diabetes with neuropathy . d\n",
+      "channel num: 106\n",
+      ". d . type d diabetes with neuropathy . d\n",
+      "channel num: 105\n",
+      "calcifications . no evidence of an abdominal aortic aneurysm or\n",
+      "channel num: 184\n",
+      "substernal chest pain that was relieved by npg sl and\n",
+      "channel num: 9\n",
+      "date ) . d . alzheimer 's dementia . d\n",
+      "channel num: 172\n",
+      "right ventricular systolic function , and moderate mitral regurgitation .\n",
+      "channel num: 10\n",
+      "not intubate . note : if applicable , an addendum\n",
+      "channel num: 25\n",
+      ". dd . recent right pedal cellulitis . allergies :\n",
+      "channel num: 193\n",
+      "urosepsis , and he was aggressively hydrated with intravenous fluids\n",
+      "channel num: 201\n",
+      ". once he was extubated and taking orals , he\n",
+      "channel num: 1\n",
+      "dd . miconazole d % powder to groin b.i.d .\n",
+      "channel num: 117\n",
+      ": d . vancomycin d g intravenously q. 24h .\n",
+      "channel num: 298\n",
+      "groin b.i.d . dd . santyl lotion to heels b.i.d\n",
+      "channel num: 180\n",
+      "and symptoms of right - sided congestive heart failure .\n",
+      "channel num: 35\n",
+      "output for dd hours . a foley catheter placed at\n",
+      "channel num: 152\n",
+      "liters of intravenous fluids and transiently started on dopamine for\n",
+      "channel num: 230\n",
+      "nasal cannula . d . infectious disease / sepsis :\n",
+      "channel num: 119\n",
+      "in date ) . d . alzheimer 's dementia .\n",
+      "channel num: 13\n",
+      ") . d . congestive heart failure ( with an\n",
+      "channel num: 197\n",
+      "wave myocardial infarction . d . acute renal failure .\n",
+      "channel num: 27\n",
+      "wave myocardial infarction . d . acute renal failure .\n"
+     ]
+    }
+   ],
+   "source": [
+    "analyze_example(X_train[0:1],y_train[0], model2, model)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "5031"
+      ]
+     },
+     "execution_count": 23,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(labels_vocab)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "False"
+      ]
+     },
+     "execution_count": 8,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "generlize"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 24,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "version = '3'\n",
+    "\n",
+    "X_train, X_test, y_train, y_test, tokens_vocab, labels_vocab = get_data()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 26,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "6527"
+      ]
+     },
+     "execution_count": 26,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(labels_vocab)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 30,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "288018"
+      ]
+     },
+     "execution_count": 30,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(tokens_vocab)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 57,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "121595"
+      ]
+     },
+     "execution_count": 57,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "shaped = True\n",
+    "generlize = False\n",
+    "version = '3'\n",
+    "X_train, X_test, y_train, y_test, tokens_vocab, labels_vocab = get_data()\n",
+    "len(tokens_vocab)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 38,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "0.8790687914039835"
+      ]
+     },
+     "execution_count": 38,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "1-121595/1005489"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 37,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "1005489"
+      ]
+     },
+     "execution_count": 37,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "words = set()\n",
+    "for line in open('mimic/3/MIMIC_ORIG',encoding='utf-8'):\n",
+    "    line = line.split('|')[3]\n",
+    "    words |= set(line.split())\n",
+    "len(words)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 42,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "1047"
+      ]
+     },
+     "execution_count": 42,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(labels_vocab)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 44,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "121595"
+      ]
+     },
+     "execution_count": 44,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(tokens_vocab)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 56,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "'' admission date : date discharge date : date date of birth : date sex : f service : medicine allergies : patient recorded as having no known allergies to drugs attending :lf chief complaint : transfer from hospital for cardiac cath major surgical or invasive procedure : cardiac cath with stenting endotracheal intubation cardioversion central line placement history of present illness : age_over_90 year old woman with h/o anemia [ * * d - d * * ] angiodysplasia - related gi bleed , h/o colon cancer , cad s/p anterior mi date , resulting in depressed ef ( dd % ) who was transferred from hospital hosp for cardiac catherization . . recent relevant history : pt had an anterior mi on date and was treated medically at nebh . she did not undergo cardiac catherization at that time . tte showed lvef = dd % with severe hypokinesis of the apex infero - apically to antero - apically . there was akinesis of the distal septum , about halfway to the apex , including the apex . there was no ar , d + mr , d + tr , with pa pressures between dd and 75mmhg . . pt was d/c ' d to a cardiac rehab where she had persistant chest discomfort , sob , palpitations with nausea , and was re - admitted to bid - location for evaluation on date . there , mi was ruled out by cardiac enzymes and pt 's symptoms were determined to be likely related to mild chf along with anxiety . pt was diuresed , then sent back to rehab with medication adjustments . back at the rehab , patient continued to have vomitting , chest tightness , and luq pain , and pt was admitted to hospital on date . again , she was ruled out for mi by ekg and cardiac enzymes . persantine stress test , which did not reproduce her pain , showed mostly fixed anterior infarct with mild lateral peri - infarct edema , no ischemia . she was d/c ' d to rehab with a diagnosis of non - cardiac chest pain likely d/t gerd . . about one week later , on [ * * d - d * * ] , she experienced similar symptoms , partially relieved by sl nitro . she went to her scheduled follow up appointments with dr . stitle and dr . stitle ( gi ) , and during it she was found to have a her hct = dd , and troponin = d.dd with equivocal ekg changes . she was admitted to hospital for transfusion , but after d unit of prbcs , she developed acute congestive heart failure . she was diuresed with lasix dd iv , given nitro paste , and , after these treatments , became hypotensive to dd/dd . dopamine was started . cardiac enzymes revealed trop d.dd and ck ddd ( mb not done ) . decision was made to transfer patient to hospital for further management / catherization . of note , her wbc also increased to dd.d , and started on empiric levaquin . . on arrival to hospital , pt admitted to ccu team . pre - cath , pt was without complaints . she was taken to cath lab , where a near total occlusion of proximal / ostial lad was found along with a lcx dd % lesion ( lcx dominant vessel ) . the lcx lesion was approached first . while intervening on the lcx lesion , the patient became hypotensive -- likely from occluding the dominant lcx , causing decreased flow to lad . with the hypotension , she also became nauseous and vomitted ( ? aspirated ) . she then became asystolic . cpr was initiated as the procedure continued . the lad lesion was stented with good resultant flow and the lcx lesion was angioplastied ( with resultant dissection ) . during this , the patient was intubated and started on levophed and dopamine . she went into a wide complex tachycardia -- vt vs. svt / sinus tach w / incomplete rbbb . she was started on lidocaine gtt and given 300mg amio bolus . at the time of transfer to the ccu , the patient 's abg was d.dd / dd/ddd and lactate d . . on arrival to the ccu , the patient was still vented . her blood pressure dropped into the 50s shortly after her arrival . after getting 2amps of bicarb , bp improved to sbp dd - 100s . a- line placement was attempted unsuccessfully ( with doppler in b/l radial vessels ) . a right femoral venous catheter was placed . of note , pt had bloody ngt drainage . . * * * cardiac review of systems is notable for current absence of dyspnea on exertion , ankle edema , syncope or presyncope . ( prior to cath ) past medical history : htn , hyperlipidemia gerd cad - nstemi [ * * d - / dddd * * ] ; p - mibi w / fixed anterior defect chf mild aymptomatic , noncritical carotid stenosis mild aortic stenosis h/o colon cancer , s/p colon resection iron deficiency anemia chronic low - grade gi bleed secondary to angiodysplasia of small bowel ? copd s/p cholecystectomy , appendectomy social history : patient had been living independently and doing her own adls until her mi in date . since her mi , she has been in rehab . family history : there is no family history of premature coronary artery disease or sudden death . physical exam : day of discharge vs : t dd , bp ddd - ddd/dd -dd , hr dd - dd , rr dd - dd , dd o2 % 1l gen : thin , in nad , resp or otherwise . oriented x3 . mood , affect appropriate . pleasant . heent : ncat . sclera anicteric . perrl , eomi . conjunctiva were pink , no pallor or cyanosis of the oral mucosa . neck : supple with no appreciable jvd . cv : rrr normal s1 / s2 , iii / vi sem heard best at lusb , no rubs or gallops chest : kyphosis , barrel chest . resp were unlabored , no accessory muscle use . no crackles , wheeze , rhonchi . abd : soft , + bruising , ntnd , no hsm or tenderness . no abdominial bruits . ext : no c / /c/e . no femoral bruits . skin : no stasis dermatitis , ulcers , scars , or xanthomas . pulses : right : carotid d + without bruit ; femoral d + without bruit ; d + dp left : carotid d + without bruit ; femoral d + without bruit ; d + dp pertinent results : date dd:dd pm blood wbc-13 .d * # rbc-2 .dd * hgb-8 .d * hct-27 .d * # mcv-97 # mch-30 .d mchc-31 .d rdw-16 .d * plt ct-453 * date dd:dd pm blood glucose-589 * urean-28 * creat-1 .d * na-125 * k-3 .d * cl-100 hco3 - d * angap-20 date dd:dd pm blood calcium-7 .d * phos-4 .d * mg-1 .d * date dd:dd pm blood pt-18 .d * ptt-150 * inr ( pt ) -d.d * date dd:dd am blood wbc-14 .d * rbc-3 .dd * hgb-11 .d * hct-34 .d * mcv-93 mch-30 .d mchc-32 .d rdw-18 .d * plt ct-486 * date dd:dd am blood glucose-106 * urean-26 * creat-1 .d * na-142 k-3 .d cl-102 hco3 - dd angap-15 date dd:dd am blood calcium-9 .d phos-3 .d mg-1 .d . date dd:dd pm blood ck ( cpk ) -ddd * date dd:dd am blood ck ( cpk ) -ddd * date dd:dd am blood ck ( cpk ) -ddd * date dd:dd pm blood ck - mb-14 * mb indx-9 .d * date dd:dd am blood ck - mb-28 * mb indx-7 .d * ctropnt-2 .dd * date dd:dd am blood ck - mb-8 ctropnt-1 .dd * . date dd:dd am blood probnp-40227 * . date dd:dd am blood alt-390 * ast-407 * ld ( ldh ) -ddd * ck ( cpk ) -ddd * alkphos-122 * amylase-208 * totbili-0 .d date dd:dd am blood alt-38 ast-24 alkphos-85 totbili-0 .d . echocardiogram date the left atrium and right atrium are normal in cavity size . left ventricular wall thicknesses and cavity size are normal . there is mild regional left ventricular systolic dysfunction with hypokinesis of the mid inferolateral wall and distal inferio wall . the remaining segments contract normally ( lvef = dd % ) . the estimated cardiac index is normal ( > = d.d l / min / m2 ) . tissue doppler imaging suggests an increased left ventricular filling pressure ( pcwp > 18mmhg ) . right ventricular chamber size and free wall motion are normal . the aortic valve leaflets are moderately thickened . there is mild - moderate aortic valve stenosis ( area d.d cm2 ) . no aortic regurgitation is seen . the mitral valve leaflets are mildly thickened . no mitral regurgitation is seen . there is at least mild pulmonary artery systolic hypertension . there is an anterior space which most likely represents a fat pad . impression : normal left ventricular cavity size with mild regional systolic dysfunction suggestive of cad . mild - moderate aortic valve stenosis . at least mild pulmonary artery systolic hypertension . brief hospital course : age_over_90 year old woman with h/o cad , s/p anterior mi date , resulting in depressed ef ( dd % ) and anemia [ * * d - d * * ] angiodysplasia - related gi bleed who was transferred from hospital hosp for cardiac catherization and is s/p lcx stent with dissection leading to cardiac arrest requiring resuscitation and intubation . clinical status gradually improved but course complicated by multiple episodes of acute on chronic congestive heart failure ( although present ef wnl ) , stable at discharge on diuretics . . d . ) cad / ischemia : s/p cardiac cath , which showed dominant lcx with dd % lesion & ostial lad lesion . the lad lesion was stented and the lcx lesion was angioplastied . this was complicated by dissection of lcx , with subsequent cardiac arrest in cath lab that resolved with cpr and pressors . the patient was medically managed with asa , plavix , statin , and metoprolol . she would benefit from starting an ace i once her creatinine has stabilized . . d . ) dysrhythmia : pt went into wide - complex tacycardia ( vt vs. svt / sinus tach with partial rbbb ) after her cardiac arrest , converting to nsr on lidocaine drip & amiodarone . pt subsequently developed a fib with rvr in the 130s , which resulted in a hypotensive episode requiring cardioversion x d before stabilizing . throughout the rest of her hospital course , patient remained in normal sinus rhythm . the amiodarone and digoxin was discontinued prior to discharge as the afib only occurred in the setting of recent mi / cardiac arrest . . d . ) acute on chronic systolic heart failure : prior echo showed an ef of dd % , improved to dd % on date echo . during her hospital course , pt had multiple episodes of acute respiratory distress secondary to the development of pulmonary edema in the setting of hypertension , likely due to a stiff lv . she was acutely managed with lasix , morphine , nitropaste and nebs prn with good response . she received afterload reduction with hydralazine . she also received a short course of prednisone in light of her copd . cxr on [ * * d - dd * * ] showed improvement in mild pulmonary edema with bilateral pleural effusions present which partially layer and occupy the fissure . pt stable on discharge dose of lasix dd mg po daily , to be sent to rehab with o2 for dyspnea on exertion . . d . ) r/o infection : differential dx of acute respiratory distress included pneumonia . cxr [ * * d - d * * ] with poor inspiratory effort and thus was difficult to interpret . endotracheal tube culture was mrsa + , and vancomycin was started empirically in the setting of acute respiratory distress although pt was afebrile with nl wbc . however , cxr [ * * d - dd * * ] was consistent with mod pulm edema with no opacities suggestive of pna , so vancomycin was discontinued . since then , patient has been afebrile , although wbc increased to peak of dd.d but trending down at dd.d on discharge in context of recent prednisone course . low suspicion for active infection as pt continued to be afebrile without cough / sputum , ua neg , ucx with normal flora , c. diff neg . . d . ) delirium : pt experience several episodes of delirium ( sundowning ) in the setting of complicated hospital course in intensive care unit . she responded well to haldol . since her transfer to the floor , her mental status is much improved without further incidences . . d . ) acute renal failure : pt with baseline cr of d.d . on discharge , creatinine is stabilizing at d.d , down from a creatinine max of d.d . we suspected this was due to contrast nephropathy , shock , or possibly prerenal volume depletion . . d . ) anemia : pt has h/o anemia due to chronic gi bleeding related to angiodysplasia of small bowel , s/p d unit prbc transfusion at osh on date . she had bloody ngt drainage post - cath . on date she had clear bloody fluid per rectum . she had a guiac + black stool on date and subsequently . however , she had a normal colonoscopy within the past year . in addition , hct was stable ( ranging from dd to dd ) and in light of her complicated hospital course , it was determined by the attending and with family that further intervention with endoscopy would not offer any therapeutic benefit . she will continue enteric - coated asa 81mg po daily and plavix dd mg po daily for her stent . she is on lansoprazole dd daily . . d . ) elevated lfts were noted post - hypotension . we suspected this was secondary to shock liver as they normalized when re - checked on date . . d . ) fen / gi : speech and swallow evaluated the patient several times post - extubation and in her most recent eval they did not find clinical evidence of aspiration and she was advanced to liquids and soft solids . clinical nutrition saw the patient on date and recommended that she be on a low salt diet with supplemental high calorie , high protein shakes . she should have regular calorie intake monitoring to ensure adequate nutrional support . medications on admission : advair diskus ddd mcg d puff b.i.d . spiriva d capsule inhaled daily aldactone dd mg p.o . daily avapro dd mg p.o . daily crestor dd mg p.o . daily desyrel dd p.o . at bedtime iron sulfate ddd mg a day lasix dd mg monday , wednesday , and friday plavix dd mg a day pletal dd mg a day protonix dd mg b.i.d . tenormin dd mg zetia dd mg a day carafate d g liquid four times daily . discharge medications : d . clopidogrel dd mg tablet sig : one ( d ) tablet po daily ( daily ) . d . rosuvastatin d mg tablet sig : two ( d ) tablet po daily ( daily ) . d . fluticasone - salmeterol ddd - dd mcg / dose disk with device sig : one ( d ) disk with device inhalation bid ( d times a day ) . d . tiotropium bromide dd mcg capsule , w / inhalation device sig : one ( d ) cap inhalation daily ( daily ) . d . albuterol sulfate d.d mg / d ml ( d.ddd % ) solution for nebulization sig : one ( d ) inhalation q4h ( every d hours ) as needed for shortness of breath or wheezing . d . hydralazine dd mg tablet sig : two ( d ) tablet po q6h ( every d hours ) . d . metoprolol tartrate dd mg tablet sig : one ( d ) tablet po bid ( d times a day ) . d . aspirin ec dd mg tablet , delayed release ( e.c . ) sig : one ( d ) tablet , delayed release ( e.c . ) po once a day . d . trazodone dd mg tablet sig : d.d tablet po hs ( at bedtime ) as needed . dd . furosemide dd mg tablet sig : one ( d ) tablet po daily ( daily ) . dd . aspirin dd mg tablet , delayed release ( e.c . ) sig : one ( d ) tablet , delayed release ( e.c . ) po daily ( daily ) . dd . prevacid solutab dd mg tablet , rapid dissolve , dr stitle : one ( d ) tablet , rapid dissolve , dr stitle once a day . dd . colace ddd mg capsule sig : one ( d ) capsule po twice a day . dd . sodium chloride d.dd % aerosol , spray sig : [ * * d - d * * ] sprays nasal qid ( d times a day ) as needed . dd . acetaminophen ddd mg tablet sig : d - d tablets po q6h ( every d hours ) as needed for fever or pain . dd . ferrous sulfate ddd mg ( dd mg iron ) tablet sig : one ( d ) tablet po once a day . dd . senna d.d mg tablet sig : one ( d ) tablet po twice a day as needed for constipation . discharge disposition : extended care facility : hospital - location discharge diagnosis : primary : coronary artery disease s/p stenting ventricular fibrillation s/p cardioversion aspiration pneumonia copd exacerbation . secondary : hypertension mental status changes chronic kidney failure discharge condition : stable . ambulating with minimal supplemental oxygen with d person assist for transfers . discharge instructions : doctor_fname were admitted for cardiac cath and underwent stenting of your coronary arteries . however , the procedure was complicated by a ventricular arrhythmia that required cardioversion . doctor_fname were intubated emergently and transferred to the cardiac intensive care unit . your heart muscle appears to have preserved function and doctor_fname will follow up with your cardiologist for a follow up echo in d - d weeks . . we have made some changes to your medications as seen below : we have discontinued your aldactone , avapro , pletal , protonix , zetia , carafate , atenolol . we have changed your lasix to 40mg by mouth daily and trazodone to 25mg po qhs . we have added the following medications : hydralazine 10mg , two tabs by mouth every d hours . metoprolol 50mg by mouth twice a day . asa 81mg po daily lansoprazole 30mg po daily . . if doctor_fname develop any new chest pain , shortness of breath or any other general worsening of condition , please call your pcp or come directly to the ed . followup instructions : dr . stitle follow up appointment on tuesday [ * * d - dd * * ] at d pm dr . stitle follow up appointment wednesday [ * * d - dd * * ] at dd am name_pattern name_pattern md md_number completed by : name_pattern name_pattern md md_number date @ dddd signed electronically by : dr . stitle dow on : tue date d:dd am ( end of report ) ''\n"
+     ]
+    }
+   ],
+   "source": [
+    "print(' '.join([tokens_vocab[x] for x in X_test[0] if x < len(tokens_vocab)]))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 58,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "admission date : date discharge date : date date of birth : date sex : f service : medicine allergies : patient recorded as having no known allergies to drugs attending :lf chief complaint : transfer from hospital for cardiac cath major surgical or invasive procedure : cardiac cath with stenting endotracheal intubation cardioversion central line placement history of present illness : age_over_90 year old woman with h/o anemia [ * * d - d * * ] angiodysplasia - related gi bleed , h/o colon cancer , cad s/p anterior mi date , resulting in depressed ef ( dd % ) who was transferred from hospital hosp for cardiac catherization . . recent relevant history : pt had an anterior mi on date and was treated medically at nebh . she did not undergo cardiac catherization at that time . tte showed lvef = dd % with severe hypokinesis of the apex infero - apically to antero - apically . there was akinesis of the distal septum , about halfway to the apex , including the apex . there was no ar , d + mr , d + tr , with pa pressures between dd and 75mmhg . . pt was d/c ' d to a cardiac rehab where she had persistant chest discomfort , sob , palpitations with nausea , and was re - admitted to bid - location for evaluation on date . there , mi was ruled out by cardiac enzymes and pt 's symptoms were determined to be likely related to mild chf along with anxiety . pt was diuresed , then sent back to rehab with medication adjustments . back at the rehab , patient continued to have vomitting , chest tightness , and luq pain , and pt was admitted to hospital on date . again , she was ruled out for mi by ekg and cardiac enzymes . persantine stress test , which did not reproduce her pain , showed mostly fixed anterior infarct with mild lateral peri - infarct edema , no ischemia . she was d/c ' d to rehab with a diagnosis of non - cardiac chest pain likely d/t gerd . . about one week later , on [ * * d - d * * ] , she experienced similar symptoms , partially relieved by sl nitro . she went to her scheduled follow up appointments with dr . stitle and dr . stitle ( gi ) , and during it she was found to have a her hct = dd , and troponin = d.dd with equivocal ekg changes . she was admitted to hospital for transfusion , but after d unit of prbcs , she developed acute congestive heart failure . she was diuresed with lasix dd iv , given nitro paste , and , after these treatments , became hypotensive to dd/dd . dopamine was started . cardiac enzymes revealed trop d.dd and ck ddd ( mb not done ) . decision was made to transfer patient to hospital for further management / catherization . of note , her wbc also increased to dd.d , and started on empiric levaquin . . on arrival to hospital , pt admitted to ccu team . pre - cath , pt was without complaints . she was taken to cath lab , where a near total occlusion of proximal / ostial lad was found along with a lcx dd % lesion ( lcx dominant vessel ) . the lcx lesion was approached first . while intervening on the lcx lesion , the patient became hypotensive -- likely from occluding the dominant lcx , causing decreased flow to lad . with the hypotension , she also became nauseous and vomitted ( ? aspirated ) . she then became asystolic . cpr was initiated as the procedure continued . the lad lesion was stented with good resultant flow and the lcx lesion was angioplastied ( with resultant dissection ) . during this , the patient was intubated and started on levophed and dopamine . she went into a wide complex tachycardia -- vt vs. svt / sinus tach w / incomplete rbbb . she was started on lidocaine gtt and given ddd mg amio bolus . at the time of transfer to the ccu , the patient 's abg was d.dd / dd/ddd and lactate d . . on arrival to the ccu , the patient was still vented . her blood pressure dropped into the 50s shortly after her arrival . after getting 2amps of bicarb , bp improved to sbp dd - 100s . a- line placement was attempted unsuccessfully ( with doppler in b/l radial vessels ) . a right femoral venous catheter was placed . of note , pt had bloody ngt drainage . . * * * cardiac review of systems is notable for current absence of dyspnea on exertion , ankle edema , syncope or presyncope . ( prior to cath ) past medical history : htn , hyperlipidemia gerd cad - nstemi [ * * d - / dddd * * ] ; p - mibi w / fixed anterior defect chf mild aymptomatic , noncritical carotid stenosis mild aortic stenosis h/o colon cancer , s/p colon resection iron deficiency anemia chronic low - grade gi bleed secondary to angiodysplasia of small bowel ? copd s/p cholecystectomy , appendectomy social history : patient had been living independently and doing her own adls until her mi in date . since her mi , she has been in rehab . family history : there is no family history of premature coronary artery disease or sudden death . physical exam : day of discharge vs : t dd , bp ddd - ddd/dd -dd , hr dd - dd , rr dd - dd , dd o2 % 1l gen : thin , in nad , resp or otherwise . oriented x3 . mood , affect appropriate . pleasant . heent : ncat . sclera anicteric . perrl , eomi . conjunctiva were pink , no pallor or cyanosis of the oral mucosa . neck : supple with no appreciable jvd . cv : rrr normal s1 / s2 , iii / vi sem heard best at lusb , no rubs or gallops chest : kyphosis , barrel chest . resp were unlabored , no accessory muscle use . no crackles , wheeze , rhonchi . abd : soft , + bruising , ntnd , no hsm or tenderness . no abdominial bruits . ext : no c / /c/e . no femoral bruits . skin : no stasis dermatitis , ulcers , scars , or xanthomas . pulses : right : carotid d + without bruit ; femoral d + without bruit ; d + dp left : carotid d + without bruit ; femoral d + without bruit ; d + dp pertinent results : date dd:dd pm blood wbc-13 .d * # rbc-2 .dd * hgb-8 .d * hct-27 .d * # mcv-97 # mch-30 .d mchc-31 .d rdw-16 .d * plt ct-453 * date dd:dd pm blood glucose-589 * urean-28 * creat-1 .d * na-125 * k-3 .d * cl-100 hco3 - d * angap-20 date dd:dd pm blood calcium-7 .d * phos-4 .d * mg-1 .d * date dd:dd pm blood pt-18 .d * ptt-150 * inr ( pt ) -d.d * date dd:dd am blood wbc-14 .d * rbc-3 .dd * hgb-11 .d * hct-34 .d * mcv-93 mch-30 .d mchc-32 .d rdw-18 .d * plt ct-486 * date dd:dd am blood glucose-106 * urean-26 * creat-1 .d * na-142 k-3 .d cl-102 hco3 - dd angap-15 date dd:dd am blood calcium-9 .d phos-3 .d mg-1 .d . date dd:dd pm blood ck ( cpk ) -ddd * date dd:dd am blood ck ( cpk ) -ddd * date dd:dd am blood ck ( cpk ) -ddd * date dd:dd pm blood ck - mb-14 * mb indx-9 .d * date dd:dd am blood ck - mb-28 * mb indx-7 .d * ctropnt-2 .dd * date dd:dd am blood ck - mb-8 ctropnt-1 .dd * . date dd:dd am blood probnp-40227 * . date dd:dd am blood alt-390 * ast-407 * ld ( ldh ) -ddd * ck ( cpk ) -ddd * alkphos-122 * amylase-208 * totbili-0 .d date dd:dd am blood alt-38 ast-24 alkphos-85 totbili-0 .d . echocardiogram date the left atrium and right atrium are normal in cavity size . left ventricular wall thicknesses and cavity size are normal . there is mild regional left ventricular systolic dysfunction with hypokinesis of the mid inferolateral wall and distal inferio wall . the remaining segments contract normally ( lvef = dd % ) . the estimated cardiac index is normal ( > = d.d l / min / m2 ) . tissue doppler imaging suggests an increased left ventricular filling pressure ( pcwp > 18mmhg ) . right ventricular chamber size and free wall motion are normal . the aortic valve leaflets are moderately thickened . there is mild - moderate aortic valve stenosis ( area d.d cm2 ) . no aortic regurgitation is seen . the mitral valve leaflets are mildly thickened . no mitral regurgitation is seen . there is at least mild pulmonary artery systolic hypertension . there is an anterior space which most likely represents a fat pad . impression : normal left ventricular cavity size with mild regional systolic dysfunction suggestive of cad . mild - moderate aortic valve stenosis . at least mild pulmonary artery systolic hypertension . brief hospital course : age_over_90 year old woman with h/o cad , s/p anterior mi date , resulting in depressed ef ( dd % ) and anemia [ * * d - d * * ] angiodysplasia - related gi bleed who was transferred from hospital hosp for cardiac catherization and is s/p lcx stent with dissection leading to cardiac arrest requiring resuscitation and intubation . clinical status gradually improved but course complicated by multiple episodes of acute on chronic congestive heart failure ( although present ef wnl ) , stable at discharge on diuretics . . d . ) cad / ischemia : s/p cardiac cath , which showed dominant lcx with dd % lesion & ostial lad lesion . the lad lesion was stented and the lcx lesion was angioplastied . this was complicated by dissection of lcx , with subsequent cardiac arrest in cath lab that resolved with cpr and pressors . the patient was medically managed with asa , plavix , statin , and metoprolol . she would benefit from starting an ace i once her creatinine has stabilized . . d . ) dysrrhythmia : pt went into wide - complex tacycardia ( vt vs. svt / sinus tach with partial rbbb ) after her cardiac arrest , converting to nsr on lidocaine drip & amiodarone . pt subsequently developed a fib with rvr in the 130s , which resulted in a hypotensive episode requiring cardioversion x d before stabilizing . throughout the rest of her hospital course , patient remained in normal sinus rhythm . the amiodarone and digoxin was discontinued prior to discharge as the afib only occurred in the setting of recent mi / cardiac arrest . . d . ) acute on chronic systolic heart failure : prior echo showed an ef of dd % , improved to dd % on date echo . during her hospital course , pt had multiple episodes of acute respiratory distress secondary to the development of pulmonary edema in the setting of hypertension , likely due to a stiff lv . she was acutely managed with lasix , morphine , nitropaste and nebs prn with good response . she received afterload reduction with hydralazine . she also received a short course of prednisone in light of her copd . cxr on [ * * d - dd * * ] showed improvement in mild pulmonary edema with bilateral pleural effusions present which partially layer and occupy the fissure . pt stable on discharge dose of lasix dd mg po daily , to be sent to rehab with o2 for dyspnea on exertion . . d . ) r/o infection : differential dx of acute respiratory distress included pneumonia . cxr [ * * d - d * * ] with poor inspiratory effort and thus was difficult to interpret . endotracheal tube culture was mrsa + , and vancomycin was started empirically in the setting of acute respiratory distress although pt was afebrile with nl wbc . however , cxr [ * * d - dd * * ] was consistent with mod pulm edema with no opacities suggestive of pna , so vancomycin was discontinued . since then , patient has been afebrile , although wbc increased to peak of dd.d but trending down at dd.d on discharge in context of recent prednisone course . low suspicion for active infection as pt continued to be afebrile without cough / sputum , ua neg , ucx with normal flora , c. diff neg . . d . ) delirium : pt experience several episodes of delirium ( sundowning ) in the setting of complicated hospital course in intensive care unit . she responded well to haldol . since her transfer to the floor , her mental status is much improved without further incidences . . d . ) acute renal failure : pt with baseline cr of d.d . on discharge , creatinine is stabilizing at d.d , down from a creatinine max of d.d . we suspected this was due to contrast nephropathy , shock , or possibly prerenal volume depletion . . d . ) anemia : pt has h/o anemia due to chronic gi bleeding related to angiodysplasia of small bowel , s/p d unit prbc transfusion at osh on date . she had bloody ngt drainage post - cath . on date she had clear bloody fluid per rectum . she had a guiac + black stool on date and subsequently . however , she had a normal colonoscopy within the past year . in addition , hct was stable ( ranging from dd to dd ) and in light of her complicated hospital course , it was determined by the attending and with family that further intervention with endoscopy would not offer any therapeutic benefit . she will continue enteric - coated asa dd mg po daily and plavix dd mg po daily for her stent . she is on lansoprazole dd daily . . d . ) elevated lfts were noted post - hypotension . we suspected this was secondary to shock liver as they normalized when re - checked on date . . d . ) fen / gi : speech and swallow evaluated the patient several times post - extubation and in her most recent eval they did not find clinical evidence of aspiration and she was advanced to liquids and soft solids . clinical nutrition saw the patient on date and recommended that she be on a low salt diet with supplemental high calorie , high protein shakes . she should have regular calorie intake monitoring to ensure adequate nutrional support . medications on admission : advair diskus ddd mcg d puff b.i.d . spiriva d capsule inhaled daily aldactone dd mg p.o . daily avapro dd mg p.o . daily crestor dd mg p.o . daily desyrel dd p.o . at bedtime iron sulfate ddd mg a day lasix dd mg monday , wednesday , and friday plavix dd mg a day pletal dd mg a day protonix dd mg b.i.d . tenormin dd mg zetia dd mg a day carafate d g liquid four times daily . discharge medications : d . clopidogrel dd mg tablet sig : one ( d ) tablet po daily ( daily ) . d . rosuvastatin d mg tablet sig : two ( d ) tablet po daily ( daily ) . d . fluticasone - salmeterol ddd - dd mcg / dose disk with device sig : one ( d ) disk with device inhalation bid ( d times a day ) . d . tiotropium bromide dd mcg capsule , w / inhalation device sig : one ( d ) cap inhalation daily ( daily ) . d . albuterol sulfate d.d mg / d ml ( d.ddd % ) solution for nebulization sig : one ( d ) inhalation q4h ( every d hours ) as needed for shortness of breath or wheezing . d . hydralazine dd mg tablet sig : two ( d ) tablet po q6h ( every d hours ) . d . metoprolol tartrate dd mg tablet sig : one ( d ) tablet po bid ( d times a day ) . d . aspirin ec dd mg tablet , delayed release ( e.c . ) sig : one ( d ) tablet , delayed release ( e.c . ) po once a day . d . trazodone dd mg tablet sig : d.d tablet po hs ( at bedtime ) as needed . dd . furosemide dd mg tablet sig : one ( d ) tablet po daily ( daily ) . dd . aspirin dd mg tablet , delayed release ( e.c . ) sig : one ( d ) tablet , delayed release ( e.c . ) po daily ( daily ) . dd . prevacid solutab dd mg tablet , rapid dissolve , dr stitle : one ( d ) tablet , rapid dissolve , dr stitle once a day . dd . colace ddd mg capsule sig : one ( d ) capsule po twice a day . dd . sodium chloride d.dd % aerosol , spray sig : [ * * d - d * * ] sprays nasal qid ( d times a day ) as needed . dd . acetaminophen ddd mg tablet sig : d - d tablets po q6h ( every d hours ) as needed for fever or pain . dd . ferrous sulfate ddd mg ( dd mg iron ) tablet sig : one ( d ) tablet po once a day . dd . senna d.d mg tablet sig : one ( d ) tablet po twice a day as needed for constipation . discharge disposition : extended care facility : hospital - location discharge diagnosis : primary : coronary artery disease s/p stenting ventricular fibrillation s/p cardioversion aspiration pneumonia copd exacerbation . secondary : hypertension mental status changes chronic kidney failure discharge condition : stable . ambulating with minimal supplemental oxygen with d person assist for transfers . discharge instructions : doctor_fname were admitted for cardiac cath and underwent stenting of your coronary arteries . however , the procedure was complicated by a ventricular arrhythmia that required cardioversion . doctor_fname were intubated emergently and transferred to the cardiac intensive care unit . your heart muscle appears to have preserved function and doctor_fname will follow up with your cardiologist for a follow up echo in d - d weeks . . we have made some changes to your medications as seen below : we have discontinued your aldactone , avapro , pletal , protonix , zetia , carafate , atenolol . we have changed your lasix to dd mg by mouth daily and trazodone to dd mg po qhs . we have added the following medications : hydralazine dd mg , two tabs by mouth every d hours . metoprolol dd mg by mouth twice a day . asa dd mg po daily lansoprazole dd mg po daily . . if doctor_fname develop any new chest pain , shortness of breath or any other general worsening of condition , please call your pcp or come directly to the ed . followup instructions : dr . stitle follow up appointment on tuesday [ * * d - dd * * ] at is_ascii pm dr . stitle follow up appointment wednesday [ * * d - dd * * ] at like_num am name_pattern name_pattern md md_number completed by : name_pattern name_pattern md md_number date @ dddd signed electronically by : dr . stitle dow on : tue date d:dd am ( end of report )\n"
+     ]
+    }
+   ],
+   "source": [
+    "print(' '.join([tokens_vocab[x] for x in X_test[0] if x < len(tokens_vocab)]))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 59,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "121595"
+      ]
+     },
+     "execution_count": 59,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(tokens_vocab)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "35280\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "1893.3973741794312"
+      ]
+     },
+     "execution_count": 15,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "tokens = []\n",
+    "u = set()\n",
+    "for line in open('mimic/3/MIMIC_FILTERED_DSUMS',encoding='utf-8').readlines()[-2285:]:\n",
+    "    tokens.append(len(line.split('|')[1].split()))\n",
+    "    u |= set(line.split('|')[1].split())\n",
+    "print(len(u))\n",
+    "np.mean(tokens)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "69248\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "1489.1068192888456"
+      ]
+     },
+     "execution_count": 14,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "tokens = []\n",
+    "u = set()\n",
+    "for line in open('mimic/2/MIMIC_FILTERED_DSUMS',encoding='utf-8').readlines()[:-2285]:\n",
+    "    tokens.append(len(line.split('|')[1].split()))\n",
+    "    u |= set(line.split('|')[1].split())\n",
+    "print(len(u))\n",
+    "np.mean(tokens)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.5.2"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 1
+}
